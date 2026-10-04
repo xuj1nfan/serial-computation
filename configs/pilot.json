@@ -1,0 +1,8 @@
+{
+  "task_family": "state_transition",
+  "state_space_size": 16,
+  "depths": [2, 4, 8, 16, 24, 32],
+  "n_per_cell": 100,
+  "seed": 0,
+  "out": "data/pilot/state_transition.jsonl"
+}
