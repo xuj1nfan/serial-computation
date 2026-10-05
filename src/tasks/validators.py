@@ -10,9 +10,26 @@ from __future__ import annotations
 
 import json
 import re
+import sys
+from argparse import ArgumentParser
+from collections import Counter
+from pathlib import Path
 
+from src.tasks.random_dag import (
+    TASK_FAMILY as DAG_TASK_FAMILY,
+)
+from src.tasks.random_dag import (
+    RandomDagTask,
+    build_dag_prompt,
+    compute_graph_depths,
+    execute_dag,
+)
+from src.tasks.state_transition import (
+    TASK_FAMILY as STATE_TASK_FAMILY,
+)
 from src.tasks.state_transition import (
     StateTransitionTask,
+    build_direct_prompt,
     execute_transition,
 )
 
@@ -22,13 +39,20 @@ _DEPTH_LINE = re.compile(r"^Apply the transition rule exactly (\d+) times\.$")
 _FINAL_TAG = re.compile(r"Final\s*[:：]\s*([A-Za-z]+)")
 
 
-def validate_task(task: StateTransitionTask) -> list[str]:
-    """校验单个任务样本。返回问题列表，空列表表示完全合法。"""
+Task = StateTransitionTask | RandomDagTask
+
+
+def validate_state_transition_task(task: StateTransitionTask) -> list[str]:
+    """校验单个状态转移样本。返回问题列表，空列表表示完全合法。"""
     problems: list[str] = []
 
     # --- 结构校验 ---
+    if task.task_family != STATE_TASK_FAMILY:
+        problems.append(f"unexpected task_family: {task.task_family!r}")
     if len(task.states) != len(set(task.states)):
         problems.append("states contain duplicates")
+    if any(re.fullmatch(r"[A-Z]", state) is None for state in task.states):
+        problems.append("states must be single uppercase letters")
     state_set = set(task.states)
     if set(task.transitions.keys()) != state_set:
         problems.append("transition table keys do not equal the state set")
@@ -71,8 +95,118 @@ def validate_task(task: StateTransitionTask) -> list[str]:
             problems.append("prompt start state does not match task.start_state")
         if p_depth != task.depth:
             problems.append("prompt depth does not match task.depth")
+    expected_prompt = build_direct_prompt(
+        task.states, task.transitions, task.start_state, task.depth
+    )
+    if task.prompt != expected_prompt:
+        problems.append("prompt is not the canonical rendering of the task")
 
     return problems
+
+
+def validate_random_dag_task(task: RandomDagTask) -> list[str]:
+    """Validate graph structure, exact depth, execution, and prompt rendering."""
+    problems: list[str] = []
+    symbol_set = set(task.symbols)
+
+    if task.task_family != DAG_TASK_FAMILY:
+        problems.append(f"unexpected task_family: {task.task_family!r}")
+    if len(task.symbols) != len(symbol_set):
+        problems.append("symbols contain duplicates")
+    if not symbol_set:
+        problems.append("symbol set is empty")
+    if any(re.fullmatch(r"[A-Z]", symbol) is None for symbol in task.symbols):
+        problems.append("symbols must be single uppercase letters")
+    if set(task.operator_table) != symbol_set:
+        problems.append("operator table rows do not equal the symbol set")
+    else:
+        output_counts: Counter[str] = Counter()
+        for left, row in task.operator_table.items():
+            if set(row) != symbol_set:
+                problems.append(f"operator table columns are incomplete for {left}")
+            bad_values = [value for value in row.values() if value not in symbol_set]
+            if bad_values:
+                problems.append(
+                    f"operator table outputs outside symbol set: {bad_values}"
+                )
+            output_counts.update(row.values())
+        expected_count = len(task.symbols)
+        if any(output_counts[symbol] != expected_count for symbol in task.symbols):
+            problems.append("operator table output distribution is not balanced")
+
+    if task.work != len(task.operations):
+        problems.append(
+            f"work={task.work} does not match {len(task.operations)} operations"
+        )
+    if len(task.inputs) != task.work + 1:
+        problems.append("a full binary tree with W operations must have W+1 inputs")
+    input_counts = Counter(task.inputs.values())
+    if (
+        input_counts
+        and max(input_counts.values())
+        - min(input_counts.get(symbol, 0) for symbol in task.symbols)
+        > 1
+    ):
+        problems.append("input symbol distribution is not balanced")
+    if task.output_node not in {op.target for op in task.operations}:
+        problems.append("output node is not defined by an operation")
+
+    recomputed_values: dict[str, str] | None = None
+    graph_depths: dict[str, int] | None = None
+    try:
+        recomputed_values = execute_dag(
+            task.symbols, task.operator_table, task.inputs, task.operations
+        )
+        graph_depths = compute_graph_depths(task.inputs, task.operations)
+    except ValueError as exc:
+        problems.append(str(exc))
+
+    if graph_depths is not None and task.output_node in graph_depths:
+        measured_depth = graph_depths[task.output_node]
+        if measured_depth != task.depth:
+            problems.append(
+                f"declared depth {task.depth} != measured depth {measured_depth}"
+            )
+
+        parents = {op.target: (op.left, op.right) for op in task.operations}
+        reachable: set[str] = set()
+        stack = [task.output_node]
+        while stack:
+            node = stack.pop()
+            if node in reachable:
+                continue
+            reachable.add(node)
+            stack.extend(parents.get(node, ()))
+        unused_operations = set(parents) - reachable
+        unused_inputs = set(task.inputs) - reachable
+        if unused_operations:
+            problems.append(
+                f"operations do not contribute to output: {unused_operations}"
+            )
+        if unused_inputs:
+            problems.append(f"inputs do not contribute to output: {unused_inputs}")
+
+    if recomputed_values is not None and task.output_node in recomputed_values:
+        if recomputed_values != task.node_values:
+            problems.append("node_values do not match independent re-execution")
+        expected_final = recomputed_values[task.output_node]
+        if task.final_state != expected_final:
+            problems.append(
+                f"final_state {task.final_state!r} != recomputed {expected_final!r}"
+            )
+
+    if task.prompt != build_dag_prompt(task):
+        problems.append("prompt is not the canonical rendering of the task")
+    return problems
+
+
+def validate_task(task: Task) -> list[str]:
+    """Dispatch validation based on the concrete task type."""
+    if isinstance(task, StateTransitionTask):
+        return validate_state_transition_task(task)
+    if isinstance(task, RandomDagTask):
+        return validate_random_dag_task(task)
+    raise TypeError(f"unsupported task type: {type(task).__name__}")
 
 
 def parse_direct_prompt(
@@ -131,9 +265,9 @@ def parse_model_answer(output: str, states: list[str]) -> dict:
     return {"answer": None, "parse_status": "no_state_found"}
 
 
-def validate_answer(task: StateTransitionTask, model_output: str) -> dict:
+def validate_answer(task: Task, model_output: str) -> dict:
     """对模型输出做 exact match 评分（论文方案第 13.1 节）。"""
-    parsed = parse_model_answer(model_output, task.states)
+    parsed = parse_model_answer(model_output, task_answer_symbols(task))
     return {
         "task_id": task.task_id,
         "parsed_answer": parsed["answer"],
@@ -143,6 +277,21 @@ def validate_answer(task: StateTransitionTask, model_output: str) -> dict:
     }
 
 
+def task_answer_symbols(task: Task) -> list[str]:
+    if isinstance(task, StateTransitionTask):
+        return task.states
+    return task.symbols
+
+
+def load_task(data: dict) -> Task:
+    task_family = data.get("task_family")
+    if task_family == STATE_TASK_FAMILY:
+        return StateTransitionTask.from_dict(data)
+    if task_family == DAG_TASK_FAMILY:
+        return RandomDagTask.from_dict(data)
+    raise ValueError(f"unknown task_family: {task_family!r}")
+
+
 def validate_dataset(path: str, verbose: bool = False) -> dict:
     """校验整个 JSONL 数据集：逐条重建任务并运行 validate_task。
 
@@ -150,16 +299,40 @@ def validate_dataset(path: str, verbose: bool = False) -> dict:
     """
     total = 0
     invalid: list[tuple[str, list[str]]] = []
+    seen_ids: set[str] = set()
     with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             total += 1
-            task = StateTransitionTask.from_dict(json.loads(line))
-            problems = validate_task(task)
+            data = json.loads(line)
+            task_id = str(data.get("task_id", f"line-{total}"))
+            problems: list[str] = []
+            if task_id in seen_ids:
+                problems.append("duplicate task_id")
+            seen_ids.add(task_id)
+            try:
+                task = load_task(data)
+                problems.extend(validate_task(task))
+            except (TypeError, ValueError, KeyError) as exc:
+                problems.append(f"could not load task: {exc}")
             if problems:
-                invalid.append((task.task_id, problems))
+                invalid.append((task_id, problems))
                 if verbose:
-                    print(f"INVALID {task.task_id}: {problems}")
+                    print(f"INVALID {task_id}: {problems}")
     return {"total": total, "valid": total - len(invalid), "invalid": invalid}
+
+
+def main() -> int:
+    parser = ArgumentParser(description="Validate a generated JSONL dataset")
+    parser.add_argument("path", type=Path)
+    parser.add_argument("--verbose", action="store_true")
+    args = parser.parse_args()
+    result = validate_dataset(str(args.path), verbose=args.verbose)
+    print(json.dumps(result, ensure_ascii=False))
+    return 0 if not result["invalid"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

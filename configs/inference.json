@@ -1,0 +1,18 @@
+{
+  "dataset": "data/pilot/random_dag.jsonl",
+  "output": "results/raw/pilot_qwen3_5_9b.jsonl",
+  "base_url": "http://127.0.0.1:8000/v1",
+  "model": "qwen-pilot",
+  "concurrency": 8,
+  "temperature": 0,
+  "seed": 0,
+  "max_tokens": 16,
+  "timeout_seconds": 180,
+  "retries": 3,
+  "api_key_env": "OPENAI_API_KEY",
+  "extra_body": {
+    "chat_template_kwargs": {
+      "enable_thinking": false
+    }
+  }
+}

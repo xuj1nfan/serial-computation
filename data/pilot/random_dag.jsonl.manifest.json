@@ -1,0 +1,21 @@
+{
+  "dataset": "data/pilot/random_dag.jsonl",
+  "sha256": "1bef5445f3b6c6ad12f9a91aa03c3c52eb3d9e64f9e2b8e68e5e844128f96d6c",
+  "records": 600,
+  "config": {
+    "task_family": "random_dag",
+    "work": 31,
+    "depths": [
+      5,
+      8,
+      12,
+      16,
+      24,
+      31
+    ],
+    "symbol_count": 8,
+    "n_per_cell": 100,
+    "seed": 0,
+    "out": "data/pilot/random_dag.jsonl"
+  }
+}

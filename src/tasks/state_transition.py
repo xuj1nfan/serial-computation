@@ -21,20 +21,20 @@ STATE_NAME_POOL = list(string.ascii_uppercase)  # A..Z, 最多 26 个状态
 class StateTransitionTask:
     task_id: str
     task_family: str
-    states: list[str]            # 系统中的全部状态名（prompt 中展示顺序已随机化）
+    states: list[str]  # 系统中的全部状态名（prompt 中展示顺序已随机化）
     transitions: dict[str, str]  # 完整映射表 f: S -> S
-    start_state: str             # s0
-    depth: int                   # D
-    trajectory: list[str]        # ground truth: [s0, s1, ..., s_D]
-    final_state: str             # s_D == trajectory[-1]
-    prompt: str                  # Direct Answer prompt（见论文方案第 8 节）
+    start_state: str  # s0
+    depth: int  # D
+    trajectory: list[str]  # ground truth: [s0, s1, ..., s_D]
+    final_state: str  # s_D == trajectory[-1]
+    prompt: str  # Direct Answer prompt（见论文方案第 8 节）
     metadata: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, d: dict) -> "StateTransitionTask":
+    def from_dict(cls, d: dict) -> StateTransitionTask:
         return cls(**d)
 
 
@@ -114,9 +114,9 @@ def generate_state_transition_task(
 
     - state_space_size: |S|，在同一实验条件下保持恒定（Answer Space Control）。
     - depth: 串行深度 D。
-    - avoid_cycle_within_depth: 若为 True，重新采样直到轨迹在 D 步内不重复
-      状态（要求 |S| > D）；默认 False——即使轨迹进环，模型仍须逐步迭代，
-      不存在 shortcut。
+    - avoid_cycle_within_depth: 若为 True，直接构造一条 D 步内不重复的轨迹
+      （要求 |S| > D）。默认 False，允许周期；这类样本只适合作为辅助任务，
+      因为周期可能缩短实际计算路径。
     """
     if not 2 <= state_space_size <= len(STATE_NAME_POOL):
         raise ValueError(f"state_space_size must be in [2, {len(STATE_NAME_POOL)}]")
@@ -128,31 +128,45 @@ def generate_state_transition_task(
             f"(got |S|={state_space_size}, D={depth})"
         )
 
-    for _ in range(max_resample):
-        # Randomization Control：状态名子集与展示顺序均随机。
-        states = rng.sample(STATE_NAME_POOL, state_space_size)
+    # ``max_resample`` remains in the signature for backward compatibility. The
+    # cycle-free path is now constructed directly instead of relying on a very
+    # low-probability rejection sampler.
+    del max_resample
+    states = rng.sample(STATE_NAME_POOL, state_space_size)
+    if avoid_cycle_within_depth:
+        trajectory = rng.sample(states, depth + 1)
+        transitions = {trajectory[i]: trajectory[i + 1] for i in range(depth)}
+        for state in states:
+            transitions.setdefault(state, rng.choice(states))
+        start_state = trajectory[0]
+    else:
         transitions = {s: rng.choice(states) for s in states}
         start_state = rng.choice(states)
         trajectory = execute_transition(transitions, start_state, depth)
-        if avoid_cycle_within_depth and len(set(trajectory)) != len(trajectory):
-            continue
-        prompt = build_direct_prompt(states, transitions, start_state, depth)
-        return StateTransitionTask(
-            task_id=task_id,
-            task_family=TASK_FAMILY,
-            states=states,
-            transitions=transitions,
-            start_state=start_state,
-            depth=depth,
-            trajectory=trajectory,
-            final_state=trajectory[-1],
-            prompt=prompt,
-            metadata={
-                "state_space_size": state_space_size,
-                "prompt_format": "direct_answer",
-            },
-        )
-    raise RuntimeError(
-        f"failed to sample a cycle-free trajectory within {max_resample} tries "
-        f"(|S|={state_space_size}, D={depth})"
+
+    prompt = build_direct_prompt(states, transitions, start_state, depth)
+    first_repeat_step = next(
+        (
+            index
+            for index, state in enumerate(trajectory)
+            if state in trajectory[:index]
+        ),
+        None,
+    )
+    return StateTransitionTask(
+        task_id=task_id,
+        task_family=TASK_FAMILY,
+        states=states,
+        transitions=transitions,
+        start_state=start_state,
+        depth=depth,
+        trajectory=trajectory,
+        final_state=trajectory[-1],
+        prompt=prompt,
+        metadata={
+            "state_space_size": state_space_size,
+            "prompt_format": "direct_answer",
+            "cycle_free_within_depth": first_repeat_step is None,
+            "first_repeat_step": first_repeat_step,
+        },
     )

@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 *.md
+.pytest_cache/
+.ruff_cache/
+results/raw/*.jsonl
